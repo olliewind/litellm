@@ -200,6 +200,24 @@ class MCPRequestHandler:
                 api_key=litellm_api_key, request=request
             )
 
+        # RFC 8707 §2 / OAuth 2.1 §5.2: once a bearer token has been accepted
+        # for an oauth2 target, enforce that — IF that target is a broker
+        # server — the token's ``aud`` actually names this server. This closes
+        # the gap where the ``elif oauth2_headers`` branch above falls through
+        # to an anonymous session for any oauth2-mode server: a broker server
+        # must reject a foreign-audience broker token or a raw upstream token
+        # rather than serve it anonymously. Gated on an Authorization token
+        # being present and a non-public route; the helper is a strict no-op
+        # unless a targeted server is genuinely ``is_oauth_broker``, so
+        # relay/delegate/byok/api_key/M2M flows are byte-unchanged.
+        if oauth2_headers and not request_route.startswith("/.well-known/"):
+            MCPRequestHandler._validate_broker_token_audience(
+                request=request,
+                mcp_servers=mcp_servers,
+                request_route=request_route,
+                token=oauth2_headers.get("Authorization", ""),
+            )
+
         return (
             validated_user_api_key_auth,
             mcp_auth_header,
@@ -373,6 +391,111 @@ class MCPRequestHandler:
         # Path did not resolve to /mcp/... targets — trust the header
         # (including an explicitly empty list, which means "no targets").
         return mcp_servers_header if mcp_servers_header is not None else []
+
+    @staticmethod
+    def _validate_broker_token_audience(
+        request: Request,
+        mcp_servers: Optional[List[str]],
+        request_route: str,
+        token: str,
+    ) -> None:
+        """RFC 8707 §2 / OAuth 2.1 §5.2: a broker-minted access token is valid
+        only for the MCP server named in its ``aud``. Reject a token whose
+        audience is for a *different* broker server, and reject any
+        non-broker / raw upstream token presented to a broker server.
+
+        Strict no-op unless a targeted server is genuinely
+        ``is_oauth_broker``. Relay (``delegate_auth_to_upstream``), byok,
+        api_key, bearer_token, and M2M flows resolve to ``is_oauth_broker ==
+        False`` and pass through untouched — this must not interfere with
+        them. An unresolvable target is also a no-op here (there is no broker
+        to enforce against); downstream routing fails closed on unknown
+        servers.
+
+        The token is the raw ``Authorization`` header value; strip the
+        ``Bearer ``/``bearer `` scheme prefix before decoding (mirrors
+        ``user_api_key_auth._get_bearer_token``) so a legitimate
+        ``Bearer <jwt>`` is not rejected as malformed.
+        """
+        # Inline imports avoid a circular dependency: mcp_server_manager and
+        # broker/oauth_utils participate in the proxy import cycle.
+        from litellm.proxy._experimental.mcp_server.broker import (  # noqa: PLC0415
+            token_audience_ok,
+        )
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (  # noqa: PLC0415, E501
+            global_mcp_server_manager,
+        )
+        from litellm.proxy._experimental.mcp_server.oauth_utils import (  # noqa: PLC0415, E501
+            get_request_base_url,
+        )
+        from litellm.proxy.proxy_server import master_key  # noqa: PLC0415
+
+        # Resolve the same target list downstream routing / the other auth
+        # gates use, so an attacker cannot flip this check by setting a
+        # permissive ``x-mcp-servers`` header while the path targets a broker.
+        target_names = MCPRequestHandler._resolve_target_server_names(
+            path=request_route, mcp_servers_header=mcp_servers
+        )
+        if not target_names:
+            return
+
+        broker_servers = []
+        for name in target_names:
+            server = global_mcp_server_manager.get_mcp_server_by_name(name)
+            # ``is True`` is intentional (mirrors
+            # _target_servers_delegate_auth_to_upstream): is_oauth_broker is a
+            # real bool property on MCPServer, so a truthy non-bool — e.g. a
+            # MagicMock attribute in tests, or any other oauth2-mode server
+            # whose flag is not an explicit True — must NOT enable broker
+            # audience enforcement and break the relay/passthrough fallback.
+            if server is not None and server.is_oauth_broker is True:
+                broker_servers.append(server)
+
+        # No targeted server is a broker → nothing to enforce. Leaves
+        # relay/delegate/byok/api_key/M2M flows byte-unchanged.
+        if not broker_servers:
+            return
+
+        # Strip the Bearer scheme prefix the client sends so the bare JWT
+        # reaches jwt.decode (token_audience_ok decodes it directly).
+        bare_token = token
+        if bare_token.startswith("Bearer "):
+            bare_token = bare_token[len("Bearer ") :]
+        elif bare_token.startswith("bearer "):
+            bare_token = bare_token[len("bearer ") :]
+
+        # master_key is the signing/verification key for broker tokens (same
+        # primitive SSO/BYOK use). If it is unset the broker could not have
+        # minted a token, so no presented token can be a valid broker token.
+        for server in broker_servers:
+            expected_resource = (
+                f"{get_request_base_url(request)}/mcp/"
+                f"{server.server_name or server.name}"
+            )
+            if not token_audience_ok(
+                bare_token,
+                expected_resource=expected_resource,
+                master_key=master_key or "",
+            ):
+                verbose_logger.debug(
+                    "Broker audience check failed for server=%s",
+                    server.server_name or server.name,
+                )
+                raise HTTPException(
+                    status_code=401,
+                    detail={
+                        "error": "invalid_token",
+                        "error_description": (
+                            "token audience does not match this MCP server"
+                        ),
+                    },
+                    headers={
+                        "WWW-Authenticate": (
+                            'Bearer error="invalid_token", '
+                            'error_description="token audience does not match this MCP server"'
+                        )
+                    },
+                )
 
     @staticmethod
     def _get_mcp_auth_header_from_headers(headers: Headers) -> Optional[str]:
