@@ -28,7 +28,7 @@ from litellm.proxy.common_utils.http_parsing_utils import _read_request_body
 from litellm.proxy.utils import get_server_root_path
 from litellm.types.mcp import MCPAuth
 from litellm.types.mcp_server.mcp_server_manager import MCPServer
-from litellm.proxy._experimental.mcp_server.broker import establish_principal
+from litellm.proxy._experimental.mcp_server.broker import establish_principal, mint_broker_token
 
 router = APIRouter(
     tags=["mcp"],
@@ -659,6 +659,49 @@ def get_mcp_server_by_id(server_id: str) -> MCPServer:
     return server
 
 
+def _get_broker_master_key() -> str:
+    from litellm.proxy.proxy_server import master_key  # same source byok uses
+    if not master_key:
+        raise HTTPException(status_code=500, detail="master_key not configured")
+    return master_key
+
+
+def _try_decode_broker_code(code: str) -> Optional[dict]:
+    """Return the broker-code payload if `code` is a LiteLLM broker code, else None
+    (a relayed upstream code won't decrypt to our JSON)."""
+    try:
+        decoded = decrypt_value_helper(code, "oauth_state")
+        if not decoded:
+            return None
+        data = json.loads(decoded)
+        return data if isinstance(data, dict) and data.get("broker_code") else None
+    except Exception:
+        return None
+
+
+def _verify_pkce_s256(verifier: str, challenge: str) -> bool:
+    calc = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    return bool(challenge) and calc == challenge
+
+
+async def broker_token_mint(*, request: Request, data: dict, code_verifier: Optional[str]) -> Dict[str, Any]:
+    """Mint the client-facing audience-bound token from an already-decoded broker code.
+    The caller (token_endpoint) has already confirmed this is a broker code."""
+    if not _verify_pkce_s256(code_verifier or "", data.get("client_code_challenge") or ""):
+        raise HTTPException(status_code=400, detail={"error": "invalid_grant"})
+    server_id = data.get("server_id")
+    principal = data.get("principal")
+    if not server_id or not principal:
+        raise HTTPException(status_code=400, detail={"error": "invalid_grant"})
+    mcp_server = get_mcp_server_by_id(server_id)
+    ttl = mcp_server.token_storage_ttl_seconds or 3600
+    minted = mint_broker_token(
+        principal=principal, server_id=server_id,
+        resource=_broker_resource(request, mcp_server),
+        master_key=_get_broker_master_key(), ttl_seconds=ttl)
+    return {"access_token": minted, "token_type": "bearer", "expires_in": ttl}
+
+
 async def _exchange_code_for_token_dict(
     *,
     request: Request,
@@ -801,6 +844,12 @@ async def token_endpoint(
     from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
         global_mcp_server_manager,
     )
+
+    if grant_type == "authorization_code" and code:
+        broker_data = _try_decode_broker_code(code)
+        if broker_data is not None:
+            result = await broker_token_mint(request=request, data=broker_data, code_verifier=code_verifier)
+            return JSONResponse(result, headers=TOKEN_NO_CACHE_HEADERS)
 
     lookup_name = mcp_server_name or client_id
     client_ip = IPAddressUtils.get_mcp_client_ip(request)
