@@ -1,5 +1,8 @@
+import base64
+import hashlib
 import html as _html
 import json
+import os
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -37,6 +40,8 @@ def encode_state_with_base_url(
     code_challenge: Optional[str] = None,
     code_challenge_method: Optional[str] = None,
     client_redirect_uri: Optional[str] = None,
+    broker_server_id: Optional[str] = None,
+    broker_code_verifier: Optional[str] = None,
 ) -> str:
     """
     Encode the base_url, original state, and PKCE parameters using encryption.
@@ -47,6 +52,8 @@ def encode_state_with_base_url(
         code_challenge: PKCE code challenge from client
         code_challenge_method: PKCE code challenge method from client
         client_redirect_uri: Original redirect_uri from client
+        broker_server_id: Server ID for broker mode (leg 2 recovery at /callback)
+        broker_code_verifier: LiteLLM's own PKCE verifier for broker leg 2
 
     Returns:
         An encrypted string that encodes all values
@@ -57,6 +64,8 @@ def encode_state_with_base_url(
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
         "client_redirect_uri": client_redirect_uri,
+        "broker_server_id": broker_server_id,
+        "broker_code_verifier": broker_code_verifier,
     }
     state_json = json.dumps(state_data, sort_keys=True)
     encrypted_state = encrypt_value_helper(state_json)
@@ -512,6 +521,122 @@ async def register_client_with_server(
     return JSONResponse(token_response)
 
 
+# ---------------------------------------------------------------------------
+# Broker mode helpers
+# ---------------------------------------------------------------------------
+
+
+def _pkce_pair():
+    """Generate a fresh PKCE verifier/challenge pair (S256)."""
+    verifier = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .rstrip(b"=")
+        .decode()
+    )
+    return verifier, challenge
+
+
+def _broker_resource(request: Request, mcp_server: MCPServer) -> str:
+    """Canonical RS identifier = the PRM `resource` (matches
+    _build_oauth_protected_resource_response, standard /mcp/{name} pattern).
+    The audience the client targets — NOT mcp_server.url."""
+    name = mcp_server.server_name or mcp_server.name
+    return f"{get_request_base_url(request)}/mcp/{name}"
+
+
+def _broker_consent_page(
+    mcp_server: MCPServer,
+    client_id: str,
+    redirect_uri: str,
+    code_challenge: Optional[str],
+    code_challenge_method: Optional[str],
+    state: str,
+    scope: Optional[str],
+) -> str:
+    fields = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "code_challenge": code_challenge or "",
+        "code_challenge_method": code_challenge_method or "",
+        "scope": scope or "",
+        "consented": "true",
+    }
+    inputs = "".join(
+        f"<input type='hidden' name='{k}' value='{_html.escape(str(v))}'>"
+        for k, v in fields.items()
+    )
+    return (
+        f"<html><body><h2>Authorize {_html.escape(client_id)} to access "
+        f"{_html.escape(mcp_server.name)}?</h2><form method='get'>{inputs}"
+        f"<button type='submit'>Allow</button></form></body></html>"
+    )
+
+
+async def broker_authorize(
+    *,
+    request,
+    mcp_server: MCPServer,
+    client_id: str,
+    redirect_uri: str,
+    state: str,
+    code_challenge: Optional[str],
+    code_challenge_method: Optional[str],
+    scope: Optional[str],
+    consented: bool,
+):
+    """Leg 1 of broker OAuth: redirect the user to the upstream IdP using
+    LiteLLM's own PKCE pair.  The client's challenge is stored in the encrypted
+    state (for Task 5 to verify) but is NOT forwarded upstream."""
+    validate_trusted_redirect_uri(request, redirect_uri)          # Imp2: validate untrusted input before anything is reflected
+    if mcp_server.authorization_url is None:
+        raise HTTPException(status_code=400, detail="MCP server authorization url is not set")
+    if not mcp_server.client_id:                                   # Imp1: misconfigured broker → clear failure (not client_id=None upstream)
+        raise HTTPException(status_code=500,
+                            detail="Broker is misconfigured: mcp_server.client_id is required for the upstream OAuth leg")
+    if not consented:
+        return HTMLResponse(
+            _broker_consent_page(
+                mcp_server,
+                client_id,
+                redirect_uri,
+                code_challenge,
+                code_challenge_method,
+                state,
+                scope,
+            )
+        )
+    verifier, challenge = _pkce_pair()
+    encoded_state = encode_state_with_base_url(
+        base_url=urlunparse(urlparse(redirect_uri)._replace(query="")),
+        original_state=state,
+        code_challenge=code_challenge,       # client's — kept in state, NOT sent upstream
+        code_challenge_method=code_challenge_method,
+        client_redirect_uri=redirect_uri,
+        broker_server_id=mcp_server.server_id,
+        broker_code_verifier=verifier,       # LiteLLM's — used at callback for leg 2
+    )
+    request_base_url = get_request_base_url(request)
+    params: Dict[str, str] = {
+        "response_type": "code",
+        "client_id": mcp_server.client_id,  # LiteLLM's upstream app
+        "redirect_uri": f"{request_base_url}/callback",
+        "code_challenge": challenge,         # LiteLLM's own challenge
+        "code_challenge_method": "S256",
+        "state": encoded_state,
+        "resource": _broker_resource(request, mcp_server),  # RFC 8707 / 9728 §7.4
+    }
+    if scope:
+        params["scope"] = scope
+    elif mcp_server.scopes:
+        params["scope"] = " ".join(mcp_server.scopes)
+    parsed = urlparse(mcp_server.authorization_url)
+    existing = dict(parse_qsl(parsed.query))
+    existing.update(params)
+    return RedirectResponse(urlunparse(parsed._replace(query=urlencode(existing))))
+
+
 @router.get("/{mcp_server_name}/authorize")
 @router.get("/authorize")
 async def authorize(
@@ -555,6 +680,19 @@ async def authorize(
                 "stored on the MCP server record. Provide client_id as a query "
                 "parameter or configure it on the server."
             },
+        )
+    if mcp_server.is_oauth_broker:
+        consented = request.query_params.get("consented") == "true"
+        return await broker_authorize(
+            request=request,
+            mcp_server=mcp_server,
+            client_id=resolved_client_id,
+            redirect_uri=redirect_uri,
+            state=state,
+            code_challenge=code_challenge,
+            code_challenge_method=code_challenge_method,
+            scope=scope,
+            consented=consented,
         )
     return await authorize_with_server(
         request=request,
