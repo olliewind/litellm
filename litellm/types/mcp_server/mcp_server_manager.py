@@ -75,6 +75,7 @@ class MCPServer(BaseModel):
     # MCPRequestHandler._target_servers_delegate_auth_to_upstream.
     delegate_auth_to_upstream: bool = False
     is_byok: bool = False
+    broker: bool = False  # oauth2 broker mode: store upstream token server-side, issue own audience-bound token (see is_oauth_broker)
     byok_description: List[str] = []
     byok_api_key_help_url: Optional[str] = None
     source_url: Optional[str] = None
@@ -111,6 +112,11 @@ class MCPServer(BaseModel):
         breaking regression introduced with the M2M feature.
         """
         return self.oauth2_flow == "client_credentials"
+
+    @property
+    def is_oauth_broker(self) -> bool:
+        """True if this server brokers upstream OAuth and issues its own tokens."""
+        return self.broker and self.auth_type == MCPAuth.oauth2
 
     @property
     def needs_user_oauth_token(self) -> bool:

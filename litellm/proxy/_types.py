@@ -1290,6 +1290,7 @@ class NewMCPServerRequest(LiteLLMPydanticObjectBase):
     available_on_public_internet: bool = True
     delegate_auth_to_upstream: bool = False
     is_byok: bool = False
+    broker: bool = False
     byok_description: List[str] = Field(default_factory=list)
     byok_api_key_help_url: Optional[str] = None
     source_url: Optional[str] = None
@@ -1373,6 +1374,7 @@ class UpdateMCPServerRequest(LiteLLMPydanticObjectBase):
     available_on_public_internet: bool = True
     delegate_auth_to_upstream: bool = False
     is_byok: bool = False
+    broker: bool = False
     byok_description: List[str] = Field(default_factory=list)
     byok_api_key_help_url: Optional[str] = None
     source_url: Optional[str] = None
@@ -1445,6 +1447,7 @@ class LiteLLM_MCPServerTable(LiteLLMPydanticObjectBase):
     available_on_public_internet: bool = True
     delegate_auth_to_upstream: bool = False
     is_byok: bool = False
+    broker: bool = False
     byok_description: List[str] = Field(default_factory=list)
     byok_api_key_help_url: Optional[str] = None
     has_user_credential: Optional[bool] = None

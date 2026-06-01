@@ -890,6 +890,7 @@ class MCPServerManager:
                 getattr(mcp_server, "tool_name_to_description", None)
             ),
             is_byok=bool(getattr(mcp_server, "is_byok", False)),
+            broker=bool(getattr(mcp_server, "broker", False)),
             byok_description=getattr(mcp_server, "byok_description", None) or [],
             byok_api_key_help_url=getattr(mcp_server, "byok_api_key_help_url", None),
             source_url=getattr(mcp_server, "source_url", None),
@@ -3749,6 +3750,7 @@ class MCPServerManager:
             available_on_public_internet=server.available_on_public_internet,
             delegate_auth_to_upstream=server.delegate_auth_to_upstream,
             is_byok=server.is_byok,
+            broker=server.broker,
             byok_description=server.byok_description,
             byok_api_key_help_url=server.byok_api_key_help_url,
             source_url=server.source_url,
