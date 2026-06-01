@@ -255,3 +255,22 @@ def test_try_decode_broker_code_returns_none_for_relay_code():
         assert _try_decode_broker_code("random-upstream-code") is None
     with patch(f"{D}.decrypt_value_helper", return_value=json.dumps({"foo": "bar"})):  # decrypts but not a broker code
         assert _try_decode_broker_code("something") is None
+
+
+def test_prm_advertises_litellm_as_as_and_canonical_resource():
+    """Regression-lock: the PRM must advertise LiteLLM itself as the authorization
+    server (not the upstream IdP), and the resource must be LiteLLM's /mcp/{name} URL.
+    A client discovering these metadata values will send its authorization request
+    to LiteLLM, which will then broker to the upstream — the foundational invariant
+    of the broker design."""
+    from unittest.mock import MagicMock
+    with (
+        patch(f"{D}.get_request_base_url", return_value="https://llm.example.com"),
+        patch(f"{D}.IPAddressUtils"),
+        patch("litellm.proxy._experimental.mcp_server.mcp_server_manager.global_mcp_server_manager") as mgr,
+    ):
+        mgr.get_mcp_server_by_name.return_value = _broker_server()
+        from litellm.proxy._experimental.mcp_server.discoverable_endpoints import _build_oauth_protected_resource_response
+        prm = _build_oauth_protected_resource_response(MagicMock(), "gitlab", True)
+    assert prm["resource"] == "https://llm.example.com/mcp/gitlab"            # canonical RS URI
+    assert prm["authorization_servers"] == ["https://llm.example.com/gitlab"]  # LiteLLM is the AS (not upstream)
