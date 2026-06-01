@@ -28,6 +28,7 @@ from litellm.proxy.common_utils.http_parsing_utils import _read_request_body
 from litellm.proxy.utils import get_server_root_path
 from litellm.types.mcp import MCPAuth
 from litellm.types.mcp_server.mcp_server_manager import MCPServer
+from litellm.proxy._experimental.mcp_server.broker import establish_principal
 
 router = APIRouter(
     tags=["mcp"],
@@ -218,12 +219,21 @@ async def _store_per_user_token_server_side(
     server: MCPServer,
     user_id: str,
     token_response: Dict[str, Any],
+    raise_on_error: bool = False,
 ) -> None:
     """Persist the OAuth token server-side and warm the Redis cache.
 
     Called from the token endpoint after a successful code exchange or refresh.
-    Errors are logged but NOT re-raised — the token is always returned to the
-    client even when server-side storage fails.
+    By default, errors are logged but NOT re-raised — the token is always
+    returned to the client even when server-side storage fails.
+
+    Args:
+        raise_on_error: When True, re-raise DB storage exceptions instead of
+            swallowing them.  The broker callback sets this to True so that a
+            store failure is surfaced as an OAuth error redirect rather than
+            silently minting an unredeemable LiteLLM code.  The relay token
+            endpoint leaves it False (default) so its existing behaviour is
+            unchanged.
     """
     from litellm.proxy._experimental.mcp_server.oauth2_token_cache import (  # noqa: PLC0415
         _compute_per_user_token_ttl,
@@ -278,6 +288,8 @@ async def _store_per_user_token_server_side(
             server.server_id,
             exc,
         )
+        if raise_on_error:
+            raise
         return  # Don't warm Redis if DB write failed
 
     # Warm the Redis cache so the first subsequent MCP call is a cache hit
@@ -637,6 +649,62 @@ async def broker_authorize(
     return RedirectResponse(urlunparse(parsed._replace(query=urlencode(existing))))
 
 
+def get_mcp_server_by_id(server_id: str) -> MCPServer:
+    """Thin resolver: delegates to the manager, raises 404 if not found.
+    Module-level so tests can patch it cleanly."""
+    from litellm.proxy._experimental.mcp_server.mcp_server_manager import global_mcp_server_manager  # noqa: PLC0415
+    server = global_mcp_server_manager.get_mcp_server_by_id(server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    return server
+
+
+async def _exchange_code_for_token_dict(
+    *,
+    request: Request,
+    mcp_server: MCPServer,
+    code: str,
+    code_verifier: Optional[str],
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Back-channel authorization_code → token dict (no JSONResponse, no store).
+
+    Used by the broker callback; the relay token endpoint may also reuse it.
+    """
+    if mcp_server.token_url is None:
+        raise HTTPException(status_code=400, detail="MCP server token url is not set")
+    resolved_client_id = mcp_server.client_id or client_id
+    resolved_client_secret = mcp_server.client_secret or client_secret
+    proxy_base_url = get_request_base_url(request)
+    token_data: Dict[str, Any] = {
+        "grant_type": "authorization_code",
+        "client_id": resolved_client_id,
+        "code": code,
+        "redirect_uri": f"{proxy_base_url}/callback",
+    }
+    if resolved_client_secret is not None:
+        token_data["client_secret"] = resolved_client_secret
+    if code_verifier:
+        token_data["code_verifier"] = code_verifier
+    async_client = get_async_httpx_client(llm_provider=httpxSpecialProvider.Oauth2Check)
+    response = await async_client.post(
+        mcp_server.token_url,
+        headers={"Accept": "application/json"},
+        data=token_data,
+    )
+    response.raise_for_status()
+    token_response: Dict[str, Any] = response.json()
+    if mcp_server.token_validation and isinstance(mcp_server.token_validation, dict):
+        _validate_token_response(
+            token_response=token_response,
+            validation_rules=mcp_server.token_validation,
+            server_id=mcp_server.server_id,
+        )
+    return token_response
+
+
 @router.get("/{mcp_server_name}/authorize")
 @router.get("/authorize")
 async def authorize(
@@ -867,6 +935,47 @@ async def callback(
         # the open-redirect + code-theft primitive even for pre-fix
         # states while permitting same-origin / allowlisted clients.
         redirect_uri = _get_validated_client_redirect_uri(request, state_data)
+
+        # Broker branch: back-channel exchange, store upstream token, issue LiteLLM code.
+        # The upstream token/code must NEVER appear in any client-facing response.
+        if state_data.get("broker_code_verifier"):
+            # get_mcp_server_by_id raises HTTPException(404) when the server is
+            # missing — that is a config error, not an OAuth error, so it stays
+            # OUTSIDE the try block and surfaces as a 404, not an error redirect.
+            mcp_server = get_mcp_server_by_id(state_data["broker_server_id"])
+            try:
+                token_response = await _exchange_code_for_token_dict(
+                    request=request,
+                    mcp_server=mcp_server,
+                    code=code,
+                    code_verifier=state_data["broker_code_verifier"],
+                )
+                principal = establish_principal(server_id=mcp_server.server_id, state=state)
+                await _store_per_user_token_server_side(
+                    server=mcp_server, user_id=principal, token_response=token_response,
+                    raise_on_error=True,
+                )
+            except Exception as exc:
+                verbose_logger.warning(
+                    "broker callback leg-2 failed for server=%s: %s",
+                    mcp_server.server_id, exc,
+                )
+                return RedirectResponse(
+                    _append_query_params(redirect_uri, {"error": "server_error", "state": original_state}),
+                    status_code=302,
+                )
+            litellm_code = encrypt_value_helper(json.dumps({
+                "broker_code": True,
+                "principal": principal,
+                "server_id": mcp_server.server_id,
+                "client_code_challenge": state_data.get("code_challenge"),
+                "client_redirect_uri": redirect_uri,
+                "original_state": original_state,
+            }, sort_keys=True))
+            return RedirectResponse(
+                _append_query_params(redirect_uri, {"code": litellm_code, "state": original_state}),
+                status_code=302,
+            )
 
         params = {"code": code, "state": original_state}
         complete_returned_url = _append_query_params(redirect_uri, params)
