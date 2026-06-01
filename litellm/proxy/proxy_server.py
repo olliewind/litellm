@@ -15828,7 +15828,7 @@ async def toolset_mcp_route(toolset_name: str, request: Request):
         finally:
             _mcp_active_toolset_id.reset(token)
 
-    except HTTPException as e:
+    except (HTTPException, ProxyException) as e:
         raise e
     except Exception as e:
         verbose_proxy_logger.error(
@@ -16009,7 +16009,7 @@ async def dynamic_mcp_route(mcp_server_name: str, request: Request):
             detail=f"MCP server, toolset, or access group '{mcp_server_name}' not found",
         )
 
-    except HTTPException as e:
+    except (HTTPException, ProxyException) as e:
         raise e
     except Exception as e:
         verbose_proxy_logger.error(

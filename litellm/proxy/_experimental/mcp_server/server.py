@@ -58,7 +58,7 @@ from litellm.llms.custom_httpx.http_handler import (
     get_async_httpx_client,
     httpxSpecialProvider,
 )
-from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.proxy.auth.ip_address_utils import IPAddressUtils
 from litellm.proxy.litellm_pre_call_utils import (
     LiteLLMProxyRequestSetup,
@@ -3264,8 +3264,8 @@ if MCP_AVAILABLE:
             if probe_status == 401:
                 # Token is missing or expired — direct the client to re-authorize.
                 authorization_uri = (
-                    f"Bearer authorization_uri="
-                    f"{base_url}/.well-known/oauth-authorization-server/{srv.name}"
+                    f'Bearer authorization_server="{base_url}/.well-known/oauth-authorization-server/{srv.name}", '
+                    f'authorization_uri="{base_url}/.well-known/oauth-authorization-server/{srv.name}"'
                 )
                 raise HTTPException(
                     status_code=401,
@@ -3329,8 +3329,8 @@ if MCP_AVAILABLE:
                     base_url = get_request_base_url(request)
 
                     authorization_uri = (
-                        f"Bearer authorization_uri="
-                        f"{base_url}/.well-known/oauth-authorization-server/{server_name}"
+                        f'Bearer authorization_server="{base_url}/.well-known/oauth-authorization-server/{server_name}", '
+                        f'authorization_uri="{base_url}/.well-known/oauth-authorization-server/{server_name}"'
                     )
 
                     raise HTTPException(
@@ -3583,8 +3583,8 @@ if MCP_AVAILABLE:
                         not in _stateful_session_auth_contexts
                     ):
                         _stateful_session_locks.pop(active_request_session_id, None)
-        except HTTPException:
-            # Re-raise HTTP exceptions to preserve status codes and details
+        except (HTTPException, ProxyException):
+            # Re-raise HTTP/Proxy exceptions to preserve status codes and details
             raise
         except Exception as e:
             verbose_logger.exception(f"Error handling MCP request: {e}")
@@ -3646,6 +3646,8 @@ if MCP_AVAILABLE:
                 _sse_client_ip,
             ):
                 await sse_session_manager.handle_request(scope, receive, send)
+        except (HTTPException, ProxyException):
+            raise
         except Exception as e:
             verbose_logger.exception(f"Error handling MCP request: {e}")
             # Instead of re-raising, try to send a graceful error response

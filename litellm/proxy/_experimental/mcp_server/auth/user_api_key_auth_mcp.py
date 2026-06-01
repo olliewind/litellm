@@ -187,6 +187,14 @@ class MCPRequestHandler:
                     validated_user_api_key_auth = UserAPIKeyAuth()
                 else:
                     raise
+        elif (
+            not litellm_api_key
+            and MCPRequestHandler._target_servers_use_oauth2(
+                path=request_route, mcp_servers=mcp_servers
+            )
+        ):
+            # Pass through empty auth to trigger the OAuth2 401+WWW-Authenticate
+            validated_user_api_key_auth = UserAPIKeyAuth()
         else:
             validated_user_api_key_auth = await user_api_key_auth(
                 api_key=litellm_api_key, request=request

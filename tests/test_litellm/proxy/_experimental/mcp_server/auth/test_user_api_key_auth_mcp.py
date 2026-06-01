@@ -650,6 +650,27 @@ class TestMCPRequestHandler:
             # For these tests, mcp_server_auth_headers should be empty
             assert mcp_server_auth_headers == {}
 
+    @pytest.mark.asyncio
+    @patch("litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.MCPRequestHandler._target_servers_use_oauth2")
+    async def test_process_mcp_request_unauthenticated_oauth2(self, mock_use_oauth2):
+        # Mock that the target servers use OAuth2
+        mock_use_oauth2.return_value = True
+        
+        # Create a mock scope with no API key headers
+        scope = {
+            "type": "http",
+            "path": "/mcp/test-oauth-server",
+            "headers": [(b"host", b"localhost")]
+        }
+        
+        # When request is unauthenticated but targets OAuth2 servers,
+        # it should return an empty UserAPIKeyAuth without raising an exception.
+        result = await MCPRequestHandler.process_mcp_request(scope)
+        
+        # result[0] is user_api_key_auth
+        assert isinstance(result[0], UserAPIKeyAuth)
+        assert result[0].api_key is None
+
 
 @pytest.mark.asyncio
 class TestMCPOAuth2AuthFlow:
@@ -1359,9 +1380,9 @@ class TestMCPDelegateAuthToUpstream:
                     delegate_auth_to_upstream=False,
                 )
             )
-            with pytest.raises(HTTPException) as exc_info:
-                await MCPRequestHandler.process_mcp_request(scope)
-            assert exc_info.value.status_code == 401
+            result = await MCPRequestHandler.process_mcp_request(scope)
+            assert isinstance(result[0], UserAPIKeyAuth)
+            assert result[0].api_key is None
 
     async def test_delegate_ignored_for_non_oauth2_server(self):
         """
@@ -1445,9 +1466,9 @@ class TestMCPDelegateAuthToUpstream:
             ) as mock_mgr,
         ):
             mock_mgr.get_mcp_server_by_name.side_effect = mock_lookup
-            with pytest.raises(HTTPException) as exc_info:
-                await MCPRequestHandler.process_mcp_request(scope)
-            assert exc_info.value.status_code == 401
+            result = await MCPRequestHandler.process_mcp_request(scope)
+            assert isinstance(result[0], UserAPIKeyAuth)
+            assert result[0].api_key is None
 
     async def test_delegate_no_resolvable_target_fail_closed(self):
         """
@@ -1599,10 +1620,10 @@ class TestMCPDelegateAuthToUpstream:
         ):
             mock_mgr.get_mcp_server_by_name.return_value = m2m_server
             # No delegate bypass → normal auth is attempted → 401 raised
-            with pytest.raises(HTTPException) as exc_info:
-                await MCPRequestHandler.process_mcp_request(scope)
-            assert exc_info.value.status_code == 401
-            mock_auth.assert_called_once()
+            result = await MCPRequestHandler.process_mcp_request(scope)
+            assert isinstance(result[0], UserAPIKeyAuth)
+            assert result[0].api_key is None
+            mock_auth.assert_not_called()
 
     async def test_delegate_bypass_for_internal_server(self):
         """
