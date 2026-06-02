@@ -1305,6 +1305,30 @@ if MCP_AVAILABLE:
             )
         return extra_headers
 
+    async def resolve_mcp_server_headers(
+        server: MCPServer,
+        user_api_key_auth: Optional[UserAPIKeyAuth],
+        mcp_server_auth_headers: Optional[Dict[str, Dict[str, str]]],
+        mcp_auth_header: Optional[str],
+        oauth2_headers: Optional[Dict[str, str]],
+        raw_headers: Optional[Dict[str, str]],
+        prefetched_creds: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Tuple[Optional[Union[Dict[str, str], str]], Optional[Dict[str, str]]]:
+        """Single source of truth for an MCP backend call's (server_auth_header,
+        extra_headers): the existing sync header prep, then the per-user OAuth override
+        / broker guard. Every dispatch path routes through this (or _apply_user_oauth_auth)."""
+        server_auth_header, extra_headers = _prepare_mcp_server_headers(
+            server=server,
+            mcp_server_auth_headers=mcp_server_auth_headers,
+            mcp_auth_header=mcp_auth_header,
+            oauth2_headers=oauth2_headers,
+            raw_headers=raw_headers,
+        )
+        extra_headers = await _apply_user_oauth_auth(
+            server, user_api_key_auth, extra_headers, prefetched_creds=prefetched_creds
+        )
+        return server_auth_header, extra_headers
+
     def _prepare_mcp_server_headers(
         server: MCPServer,
         mcp_server_auth_headers: Optional[Dict[str, Dict[str, str]]],

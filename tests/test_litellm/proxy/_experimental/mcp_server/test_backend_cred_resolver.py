@@ -80,3 +80,20 @@ async def test_m2m_no_extra_headers_uses_fallback_fetch():
         out = await _apply_user_oauth_auth(srv, auth, None)
     assert out is None
     f.assert_awaited()   # pre-existing fallback fetch preserved
+
+
+@pytest.mark.asyncio
+async def test_resolver_applies_override_after_prepare():
+    srv = _srv(broker=True)
+    auth = UserAPIKeyAuth(api_key="x", user_id="mcp-oauth:abc")
+    with (
+        patch(f"{S}._prepare_mcp_server_headers", return_value=("SAH", {"Authorization": "Bearer CLIENT"})),
+        patch(f"{S}._get_user_oauth_extra_headers_from_db", new=AsyncMock(return_value={"Authorization": "Bearer STORED"})),
+    ):
+        from litellm.proxy._experimental.mcp_server.server import resolve_mcp_server_headers
+        sah, eh = await resolve_mcp_server_headers(
+            server=srv, user_api_key_auth=auth, mcp_server_auth_headers=None,
+            mcp_auth_header=None, oauth2_headers={"Authorization": "Bearer CLIENT"}, raw_headers=None,
+        )
+    assert sah == "SAH"                                   # base server_auth_header preserved
+    assert eh == {"Authorization": "Bearer STORED"}       # override applied
