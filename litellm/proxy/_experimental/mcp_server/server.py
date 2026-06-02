@@ -1254,6 +1254,57 @@ if MCP_AVAILABLE:
             )
             return {}
 
+    async def _apply_user_oauth_auth(
+        server: MCPServer,
+        user_api_key_auth: Optional[UserAPIKeyAuth],
+        extra_headers: Optional[Dict[str, str]],
+        prefetched_creds: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, str]]:
+        """Resolve the per-user OAuth backend Authorization for an oauth2 server.
+
+        Replaces ``extra_headers`` with the server-side-stored per-user token when one
+        exists. A broker (``is_oauth_broker``) must NEVER fall through to the client's
+        bearer — that is a LiteLLM-minted JWT, never an upstream credential — so with no
+        stored token it raises 401 to force re-auth. Non-broker / relay (delegate)
+        servers fall through unchanged (relay forwards the client token, which IS the
+        real upstream credential). Non-oauth2 servers are untouched.
+        """
+        if server.auth_type != MCPAuth.oauth2 or user_api_key_auth is None:
+            return extra_headers
+        if server.needs_user_oauth_token:
+            db_headers = await _get_user_oauth_extra_headers_from_db(
+                server, user_api_key_auth, prefetched_creds=prefetched_creds
+            )
+            if db_headers:
+                return db_headers
+            if server.is_oauth_broker:
+                raise HTTPException(
+                    status_code=401,
+                    detail={
+                        "error": "oauth_auth_required",
+                        "server_id": server.server_id,
+                        "server_name": server.server_name or server.name,
+                        "message": (
+                            "No stored OAuth token for this broker server. "
+                            "Complete the OAuth authorization flow to continue."
+                        ),
+                    },
+                    headers={
+                        "WWW-Authenticate": 'Bearer resource_metadata="/.well-known/oauth-protected-resource"'
+                    },
+                )
+            return extra_headers
+        # oauth2 server without per-user-token semantics (e.g. M2M): preserve the
+        # pre-existing fallback fetch (returns None for M2M — no per-user token is stored).
+        if extra_headers is None:
+            return (
+                await _get_user_oauth_extra_headers_from_db(
+                    server, user_api_key_auth, prefetched_creds=prefetched_creds
+                )
+                or extra_headers
+            )
+        return extra_headers
+
     def _prepare_mcp_server_headers(
         server: MCPServer,
         mcp_server_auth_headers: Optional[Dict[str, Dict[str, str]]],
