@@ -2422,6 +2422,13 @@ if MCP_AVAILABLE:
             elif mcp_server.is_byok:
                 # External auth header supplied; still enforce user-identity check.
                 await _check_byok_credential(mcp_server, user_api_key_auth)
+            elif mcp_server.needs_user_oauth_token and not mcp_auth_header:
+                # Per-user OAuth (broker / non-delegate oauth2): inject the stored
+                # token so the managed dispatch never forwards the client's bearer.
+                # Relay (delegate) servers have no stored token -> unchanged.
+                oauth2_headers = await _apply_user_oauth_auth(
+                    mcp_server, user_api_key_auth, oauth2_headers
+                )
 
         # Check if tool exists in local registry first (for OpenAPI-based tools)
         # These tools are registered with their prefixed names

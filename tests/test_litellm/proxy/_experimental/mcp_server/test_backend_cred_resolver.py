@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi import HTTPException
 from litellm.types.mcp_server.mcp_server_manager import MCPServer
 from litellm.proxy._types import UserAPIKeyAuth
@@ -97,3 +97,36 @@ async def test_resolver_applies_override_after_prepare():
         )
     assert sah == "SAH"                                   # base server_auth_header preserved
     assert eh == {"Authorization": "Bearer STORED"}       # override applied
+
+
+@pytest.mark.asyncio
+async def test_execute_mcp_tool_injects_stored_token_for_broker():
+    srv = _srv(broker=True)
+    auth = UserAPIKeyAuth(api_key="x", user_id="mcp-oauth:abc")
+    captured = {}
+
+    async def _managed(**kwargs):
+        captured.update(kwargs)
+        return MagicMock(content=[], isError=False)
+
+    with (
+        patch(f"{S}._handle_managed_mcp_tool", new=_managed),
+        patch(f"{S}._get_user_oauth_extra_headers_from_db",
+              new=AsyncMock(return_value={"Authorization": "Bearer STORED"})),
+        patch(f"{S}.global_mcp_tool_registry") as reg,
+        patch(f"{S}.global_mcp_server_manager") as mgr,
+        patch(f"{S}.MCPRequestHandler") as rh,
+    ):
+        reg.get_tool.return_value = None  # not a local tool -> managed path
+        mgr._get_mcp_server_from_tool_name.return_value = srv
+        rh.is_tool_allowed.return_value = True
+        from litellm.proxy._experimental.mcp_server.server import execute_mcp_tool
+        await execute_mcp_tool(
+            name="gitlab/whoami", arguments={},
+            allowed_mcp_servers=[srv], start_time=MagicMock(),
+            user_api_key_auth=auth,
+            mcp_auth_header=None, oauth2_headers={"Authorization": "Bearer CLIENT-JWT"},
+            raw_headers=None,
+        )
+    # the managed dispatch must receive the STORED token, never the client's JWT
+    assert captured["oauth2_headers"] == {"Authorization": "Bearer STORED"}
