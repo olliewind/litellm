@@ -130,3 +130,15 @@ async def test_execute_mcp_tool_injects_stored_token_for_broker():
         )
     # the managed dispatch must receive the STORED token, never the client's JWT
     assert captured["oauth2_headers"] == {"Authorization": "Bearer STORED"}
+
+
+@pytest.mark.asyncio
+async def test_broker_never_forwards_client_bearer():
+    srv = _srv(broker=True)
+    auth = UserAPIKeyAuth(api_key="x", user_id="mcp-oauth:abc")
+    client = {"Authorization": "Bearer CLIENT-JWT"}
+    with patch(f"{S}._get_user_oauth_extra_headers_from_db",
+               new=AsyncMock(return_value={"Authorization": "Bearer STORED"})):
+        from litellm.proxy._experimental.mcp_server.server import _apply_user_oauth_auth
+        out = await _apply_user_oauth_auth(srv, auth, client)
+    assert out != client and out == {"Authorization": "Bearer STORED"}
