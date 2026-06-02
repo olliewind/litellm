@@ -75,11 +75,12 @@ def _call(token: str, server: MCPServer, *, path: str = "/mcp/gitlab"):
         )
 
 
-# (a) matching aud → no raise -------------------------------------------------
+# (a) matching aud → no raise, resolves principal -----------------------------
 def test_matching_audience_passes():
     server = _server()
-    # Returns None and does not raise.
-    assert _call(_token_for(server), server) is None
+    # Does not raise; on success the helper resolves the principal (the
+    # ``user_id`` claim ``_token_for`` minted) so the inject path can fire.
+    assert _call(_token_for(server), server) == "mcp-oauth:abc"
 
 
 def test_matching_audience_with_bearer_prefix_passes():
@@ -87,7 +88,7 @@ def test_matching_audience_with_bearer_prefix_passes():
     the helper must strip it before decoding (jwt.decode would otherwise fail
     and reject a legitimate token)."""
     server = _server()
-    assert _call("Bearer " + _token_for(server), server) is None
+    assert _call("Bearer " + _token_for(server), server) == "mcp-oauth:abc"
 
 
 # (b) foreign aud → 401 -------------------------------------------------------
@@ -147,7 +148,8 @@ def test_resource_uses_server_name_when_present():
     server = _server(name="display-name", server_name="gitlab")
     # Token aud must match server_name-derived resource, not name-derived.
     good = _token_for(server, resource=f"{_BASE_URL}/mcp/gitlab")
-    assert _call(good, server, path="/mcp/gitlab") is None
+    # Valid aud → resolves the minted principal (no raise).
+    assert _call(good, server, path="/mcp/gitlab") == "mcp-oauth:abc"
 
     bad = _token_for(server, resource=f"{_BASE_URL}/mcp/display-name")
     with pytest.raises(HTTPException) as exc:
@@ -182,7 +184,8 @@ def test_mixed_targets_broker_enforced():
 
 def test_valid_broker_token_with_mixed_targets_passes():
     """A token with the correct audience for the broker server must NOT raise,
-    even when another target in the same request is a non-broker (relay) server."""
+    even when another target in the same request is a non-broker (relay) server.
+    On success the helper resolves the broker's principal."""
     broker = _server(server_id="s1", name="gitlab", broker=True)
     relay = _server(server_id="s2", name="relay", broker=False)
 
@@ -201,7 +204,7 @@ def test_valid_broker_token_with_mixed_targets_passes():
             request_route="/some/non-mcp-path",
             token=correct_token,
         )
-    assert result is None
+    assert result == "mcp-oauth:abc"
 
 
 def test_unresolvable_target_is_noop():

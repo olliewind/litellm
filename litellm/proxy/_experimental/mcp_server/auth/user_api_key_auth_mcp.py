@@ -211,12 +211,25 @@ class MCPRequestHandler:
         # unless a targeted server is genuinely ``is_oauth_broker``, so
         # relay/delegate/byok/api_key/M2M flows are byte-unchanged.
         if oauth2_headers and not request_route.startswith("/.well-known/"):
-            MCPRequestHandler._validate_broker_token_audience(
+            broker_principal = MCPRequestHandler._validate_broker_token_audience(
                 request=request,
                 mcp_servers=mcp_servers,
                 request_route=request_route,
                 token=oauth2_headers.get("Authorization", ""),
             )
+            # A valid broker token carries the per-grant principal under which
+            # the upstream credential was stored server-side. ``user_api_key_auth``
+            # cannot consume an HS256 master-key broker token, so the branches
+            # above left this request on the anonymous oauth2 fallback
+            # (``user_id=None``). Resolve the principal here so the existing
+            # inject path (``_get_user_oauth_extra_headers_from_db``, keyed on
+            # ``(user_id, server_id)``) retrieves and forwards the stored
+            # upstream token. Only override the anonymous fallback — never
+            # clobber an explicit ``x-litellm-api-key`` that already resolved a
+            # real user (do-not-clobber guard). Non-broker / invalid-token flows
+            # return ``None`` here, so they stay byte-unchanged.
+            if broker_principal and not validated_user_api_key_auth.user_id:
+                validated_user_api_key_auth = UserAPIKeyAuth(user_id=broker_principal)
 
         return (
             validated_user_api_key_auth,
@@ -398,19 +411,37 @@ class MCPRequestHandler:
         mcp_servers: Optional[List[str]],
         request_route: str,
         token: str,
-    ) -> None:
+    ) -> Optional[str]:
         """RFC 8707 §2 / OAuth 2.1 §5.2: a broker-minted access token is valid
         only for the MCP server named in its ``aud``. Reject a token whose
         audience is for a *different* broker server, and reject any
         non-broker / raw upstream token presented to a broker server.
 
+        On a SUCCESSFUL validation for a broker target, also resolve and return
+        the principal — the ``user_id`` claim from the now-fully-validated token
+        (signature + ``aud`` + ``exp`` all checked, so the claim is trustworthy).
+        The caller uses this to build ``UserAPIKeyAuth(user_id=principal)`` so
+        the existing per-user OAuth inject path
+        (``server.py::_get_user_oauth_extra_headers_from_db``, keyed on
+        ``(user_id, server_id)``) resolves the stored upstream token. Without
+        this, the broker token — which ``user_api_key_auth`` cannot consume —
+        leaves the request anonymous (``user_id=None``) and the upstream token
+        is never injected.
+
+        Returns:
+            The resolved principal (``user_id`` claim) when a valid broker token
+            was presented to a broker target; ``None`` when there is no broker
+            to enforce against (non-broker / unresolvable target — a strict
+            no-op). Raises ``HTTPException(401)`` on aud mismatch / invalid /
+            raw / wrong-key token presented to a broker target.
+
         Strict no-op unless a targeted server is genuinely
         ``is_oauth_broker``. Relay (``delegate_auth_to_upstream``), byok,
         api_key, bearer_token, and M2M flows resolve to ``is_oauth_broker ==
-        False`` and pass through untouched — this must not interfere with
-        them. An unresolvable target is also a no-op here (there is no broker
-        to enforce against); downstream routing fails closed on unknown
-        servers.
+        False`` and pass through untouched (return ``None``) — this must not
+        interfere with them. An unresolvable target is also a no-op here (there
+        is no broker to enforce against); downstream routing fails closed on
+        unknown servers.
 
         The token is the raw ``Authorization`` header value; strip the
         ``Bearer ``/``bearer `` scheme prefix before decoding (mirrors
@@ -419,6 +450,8 @@ class MCPRequestHandler:
         """
         # Inline imports avoid a circular dependency: mcp_server_manager and
         # broker/oauth_utils participate in the proxy import cycle.
+        import jwt  # noqa: PLC0415
+
         from litellm.proxy._experimental.mcp_server.broker import (  # noqa: PLC0415
             token_audience_ok,
         )
@@ -467,6 +500,13 @@ class MCPRequestHandler:
         # master_key is the signing/verification key for broker tokens (same
         # primitive SSO/BYOK use). If it is unset the broker could not have
         # minted a token, so no presented token can be a valid broker token.
+        #
+        # A single token's ``aud`` names exactly one resource, so if multiple
+        # brokers are targeted the token can match at most one — the others
+        # raise below. Thus a token that survives the whole loop is valid for
+        # every targeted broker, and decoding it once against any matched
+        # broker's resource yields the (now-trustworthy) principal.
+        validated_resource: Optional[str] = None
         for server in broker_servers:
             expected_resource = (
                 f"{get_request_base_url(request)}/mcp/"
@@ -496,6 +536,33 @@ class MCPRequestHandler:
                         )
                     },
                 )
+            # A single JWT `aud` can match at most one resource, so every broker target
+            # that survives the check above shares the same resource — validated_resource
+            # is therefore unambiguous and is what we re-decode against to read the principal.
+            validated_resource = expected_resource
+
+        # Every targeted broker validated. Re-decode with the SAME validation
+        # ``token_audience_ok`` performed (signature + ``aud`` + ``exp``) so the
+        # ``user_id`` claim is trustworthy, and return it as the resolved
+        # principal. A broker token without a ``user_id`` claim (it always has
+        # one — see ``broker.mint_broker_token``) yields ``None``, which the
+        # caller treats as "no principal" (no override, fails safe).
+        if validated_resource is not None:
+            try:
+                claims = jwt.decode(
+                    bare_token,
+                    master_key or "",
+                    algorithms=["HS256"],
+                    audience=validated_resource,
+                )
+            except jwt.PyJWTError:
+                # Unreachable in practice: token_audience_ok already decoded
+                # successfully with identical parameters. Fail safe to "no
+                # principal" rather than masking it as a 500.
+                return None
+            return claims.get("user_id")
+
+        return None
 
     @staticmethod
     def _get_mcp_auth_header_from_headers(headers: Headers) -> Optional[str]:
