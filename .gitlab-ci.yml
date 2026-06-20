@@ -37,11 +37,11 @@ dev-image:
     - apk add --no-cache curl jq
   script:
     # 1. Post a placeholder comment and extract the note ID
-    - 'NOTE_RESPONSE=$(curl -s --request POST --header "PRIVATE-TOKEN: $GITLAB_TOKEN" --header "Content-Type: application/json" "https://${CI_SERVER_HOST}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes" --data "{\"body\": \"⏳ Building Container Image...\"}")'
+    - 'NOTE_RESPONSE=$(curl -s --request POST --header "JOB-TOKEN: $CI_JOB_TOKEN" --header "Content-Type: application/json" "https://${CI_SERVER_HOST}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes" --data "{\"body\": \"⏳ Building Container Image...\"}")'
     - 'NOTE_ID=$(echo $NOTE_RESPONSE | jq -r ".id")'
     - echo "Created note with ID $NOTE_ID"
     # 2. Build and push the image
     - docker build -f docker/Dockerfile.non_root --build-arg PROXY_EXTRAS_SOURCE=local -t "$CI_REGISTRY_IMAGE:$TAG" .
     - docker push "$CI_REGISTRY_IMAGE:$TAG"
     # 3. Update the comment with the final URL
-    - 'if [ "$NOTE_ID" != "null" ] && [ -n "$NOTE_ID" ]; then curl -s --request PUT --header "PRIVATE-TOKEN: $GITLAB_TOKEN" --header "Content-Type: application/json" "https://${CI_SERVER_HOST}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes/$NOTE_ID" --data "{\"body\": \"✅ Container Image built. Available at URL: \`$CI_REGISTRY_IMAGE:$TAG\`\"}"; else echo "Failed to create or update note. Please ensure GITLAB_TOKEN is set with api scope."; fi'
+    - 'if [ "$NOTE_ID" != "null" ] && [ -n "$NOTE_ID" ]; then curl -s --request PUT --header "JOB-TOKEN: $CI_JOB_TOKEN" --header "Content-Type: application/json" "https://${CI_SERVER_HOST}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes/$NOTE_ID" --data "{\"body\": \"✅ Container Image built. Available at URL: \`$CI_REGISTRY_IMAGE:$TAG\`\"}"; else echo "MR note skipped (CI_JOB_TOKEN could not post to the notes API); image build still succeeded."; fi'
