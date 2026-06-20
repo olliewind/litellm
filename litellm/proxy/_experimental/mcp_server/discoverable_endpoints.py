@@ -25,7 +25,7 @@ from litellm.proxy.common_utils.encrypt_decrypt_utils import (
     encrypt_value_helper,
 )
 from litellm.proxy.common_utils.http_parsing_utils import _read_request_body
-from litellm.proxy.utils import get_server_root_path
+from litellm.proxy.utils import get_server_root_path, get_prisma_client_or_throw
 from litellm.types.mcp import MCPAuth
 from litellm.types.mcp_server.mcp_server_manager import MCPServer
 from litellm.proxy._experimental.mcp_server.broker import (
@@ -714,6 +714,48 @@ async def broker_token_mint(*, request: Request, data: dict, code_verifier: Opti
             "refresh_token": refresh}
 
 
+def _safe_get_mcp_server_by_id(server_id: str) -> Optional[MCPServer]:
+    """Like get_mcp_server_by_id but returns None instead of raising 404, so a
+    broker-shaped refresh token naming an unknown server falls through to the
+    upstream relay rather than erroring."""
+    try:
+        return get_mcp_server_by_id(server_id)
+    except HTTPException:
+        return None
+
+
+async def broker_token_refresh(*, request: Request, payload: dict,
+                               mcp_server: MCPServer) -> Dict[str, Any]:
+    """Issue a fresh access+refresh pair from a VERIFIED broker refresh-token payload.
+    Confirms the upstream credential still exists for the principal; else invalid_grant
+    so the client re-runs the full authorization flow."""
+    from litellm.proxy._experimental.mcp_server.db import get_user_oauth_credential  # noqa: PLC0415
+
+    principal = payload.get("user_id")
+    server_id = payload.get("server_id")
+    if not principal or not server_id:
+        raise HTTPException(status_code=400, detail={"error": "invalid_grant"})
+
+    prisma_client = get_prisma_client_or_throw(
+        "Database not connected. Cannot refresh broker token."
+    )
+    cred = await get_user_oauth_credential(prisma_client, principal, server_id)
+    if not cred or not cred.get("access_token"):
+        raise HTTPException(status_code=400, detail={"error": "invalid_grant"})
+
+    resource = _broker_resource(request, mcp_server)
+    master_key = _get_broker_master_key()
+    ttl = mcp_server.token_storage_ttl_seconds or 3600
+    minted = mint_broker_token(
+        principal=principal, server_id=server_id, resource=resource,
+        master_key=master_key, ttl_seconds=ttl)
+    refresh = mint_broker_refresh_token(
+        principal=principal, server_id=server_id, resource=resource,
+        master_key=master_key, ttl_seconds=MCP_BROKER_REFRESH_TOKEN_TTL)
+    return {"access_token": minted, "token_type": "bearer", "expires_in": ttl,
+            "refresh_token": refresh}
+
+
 async def _exchange_code_for_token_dict(
     *,
     request: Request,
@@ -862,6 +904,22 @@ async def token_endpoint(
         if broker_data is not None:
             result = await broker_token_mint(request=request, data=broker_data, code_verifier=code_verifier)
             return JSONResponse(result, headers=TOKEN_NO_CACHE_HEADERS)
+
+    if grant_type == "refresh_token" and refresh_token:
+        peeked_id = peek_broker_refresh_server_id(refresh_token)
+        broker_srv = _safe_get_mcp_server_by_id(peeked_id) if peeked_id else None
+        if broker_srv is not None:
+            payload = decode_broker_refresh_token(
+                refresh_token,
+                expected_resource=_broker_resource(request, broker_srv),
+                master_key=_get_broker_master_key(),
+            )
+            if payload is not None:
+                result = await broker_token_refresh(
+                    request=request, payload=payload, mcp_server=broker_srv)
+                return JSONResponse(result, headers=TOKEN_NO_CACHE_HEADERS)
+        # not a decodable broker refresh token (None id / unknown server / bad
+        # signature / wrong type) → fall through to the upstream relay below.
 
     lookup_name = mcp_server_name or client_id
     client_ip = IPAddressUtils.get_mcp_client_ip(request)

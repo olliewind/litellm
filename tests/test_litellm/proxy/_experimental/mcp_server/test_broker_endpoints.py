@@ -4,6 +4,7 @@ import json
 import pytest
 import jwt
 from fastapi import HTTPException
+from fastapi.responses import JSONResponse
 from unittest.mock import AsyncMock, MagicMock, patch
 from litellm.types.mcp_server.mcp_server_manager import MCPServer
 
@@ -297,3 +298,91 @@ async def test_broker_token_mint_includes_refresh_token():
     assert claims["token_type"] == "mcp_broker_refresh"
     assert claims["user_id"] == "mcp-oauth:abc"
     assert claims["server_id"] == "s1"
+
+
+def _mint_refresh(server_id="s1", resource="https://llm.example.com/mcp/gitlab",
+                  principal="mcp-oauth:abc", key="test-master-key-0123456789abcdef0123456789abcdef"):
+    from litellm.proxy._experimental.mcp_server.broker import mint_broker_refresh_token
+    return mint_broker_refresh_token(principal=principal, server_id=server_id, resource=resource,
+                                     master_key=key, ttl_seconds=3600)
+
+
+@pytest.mark.asyncio
+async def test_token_endpoint_broker_refresh_issues_new_pair():
+    server = _broker_server()
+    key = "test-master-key-0123456789abcdef0123456789abcdef"
+    tok = _mint_refresh()
+    with (
+        patch(f"{D}.get_mcp_server_by_id", return_value=server),
+        patch(f"{D}.get_request_base_url", return_value="https://llm.example.com"),
+        patch(f"{D}._get_broker_master_key", return_value=key),
+        patch(f"{D}.get_prisma_client_or_throw", return_value=MagicMock()),
+        patch("litellm.proxy._experimental.mcp_server.db.get_user_oauth_credential",
+              new=AsyncMock(return_value={"access_token": "UPSTREAM"})),
+    ):
+        from litellm.proxy._experimental.mcp_server.discoverable_endpoints import token_endpoint
+        resp = await token_endpoint(request=MagicMock(), grant_type="refresh_token",
+                                    code=None, redirect_uri=None, client_id="claude",
+                                    client_secret=None, code_verifier=None, refresh_token=tok,
+                                    scope=None, mcp_server_name=None)
+    body = json.loads(resp.body)
+    assert body["token_type"] == "bearer"
+    assert "access_token" in body and "refresh_token" in body
+    access = jwt.decode(body["access_token"], key, algorithms=["HS256"],
+                        audience="https://llm.example.com/mcp/gitlab")
+    assert access["token_type"] == "mcp_broker"
+    refresh = jwt.decode(body["refresh_token"], key, algorithms=["HS256"],
+                         audience="https://llm.example.com/mcp/gitlab")
+    assert refresh["token_type"] == "mcp_broker_refresh"
+
+
+@pytest.mark.asyncio
+async def test_token_endpoint_broker_refresh_invalid_grant_when_cred_missing():
+    server = _broker_server()
+    key = "test-master-key-0123456789abcdef0123456789abcdef"
+    tok = _mint_refresh()
+    with (
+        patch(f"{D}.get_mcp_server_by_id", return_value=server),
+        patch(f"{D}.get_request_base_url", return_value="https://llm.example.com"),
+        patch(f"{D}._get_broker_master_key", return_value=key),
+        patch(f"{D}.get_prisma_client_or_throw", return_value=MagicMock()),
+        patch("litellm.proxy._experimental.mcp_server.db.get_user_oauth_credential",
+              new=AsyncMock(return_value=None)),
+    ):
+        from litellm.proxy._experimental.mcp_server.discoverable_endpoints import token_endpoint
+        with pytest.raises(HTTPException) as ei:
+            await token_endpoint(request=MagicMock(), grant_type="refresh_token",
+                                 code=None, redirect_uri=None, client_id="claude",
+                                 client_secret=None, code_verifier=None, refresh_token=tok,
+                                 scope=None, mcp_server_name=None)
+    assert ei.value.status_code == 400
+    assert ei.value.detail == {"error": "invalid_grant"}
+
+
+@pytest.mark.asyncio
+async def test_token_endpoint_access_token_as_refresh_falls_through_to_upstream():
+    # A broker ACCESS token (token_type=mcp_broker) presented as refresh_token must NOT
+    # renew via the broker path — it fails the type guard and falls through to the
+    # upstream relay (exchange_token_with_server).
+    server = _broker_server()
+    key = "test-master-key-0123456789abcdef0123456789abcdef"
+    from litellm.proxy._experimental.mcp_server.broker import mint_broker_token
+    access = mint_broker_token(principal="mcp-oauth:abc", server_id="s1",
+                               resource="https://llm.example.com/mcp/gitlab",
+                               master_key=key, ttl_seconds=3600)
+    relay = AsyncMock(return_value=JSONResponse({"relayed": True}))
+    with (
+        patch(f"{D}.get_mcp_server_by_id", return_value=server),
+        patch(f"{D}.get_request_base_url", return_value="https://llm.example.com"),
+        patch(f"{D}._get_broker_master_key", return_value=key),
+        patch(f"{D}.exchange_token_with_server", new=relay),
+        patch("litellm.proxy._experimental.mcp_server.mcp_server_manager.global_mcp_server_manager") as mgr,
+        patch(f"{D}.IPAddressUtils"),
+    ):
+        mgr.get_mcp_server_by_name.return_value = server
+        from litellm.proxy._experimental.mcp_server.discoverable_endpoints import token_endpoint
+        await token_endpoint(request=MagicMock(), grant_type="refresh_token",
+                             code=None, redirect_uri=None, client_id="claude",
+                             client_secret=None, code_verifier=None, refresh_token=access,
+                             scope=None, mcp_server_name=None)
+    relay.assert_awaited_once()   # fell through to the upstream relay
