@@ -360,6 +360,29 @@ async def test_token_endpoint_broker_refresh_invalid_grant_when_cred_missing():
 
 
 @pytest.mark.asyncio
+async def test_token_endpoint_broker_refresh_invalid_grant_when_access_token_absent():
+    server = _broker_server()
+    key = "test-master-key-0123456789abcdef0123456789abcdef"
+    tok = _mint_refresh()
+    with (
+        patch(f"{D}.get_mcp_server_by_id", return_value=server),
+        patch(f"{D}.get_request_base_url", return_value="https://llm.example.com"),
+        patch(f"{D}._get_broker_master_key", return_value=key),
+        patch(f"{D}.get_prisma_client_or_throw", return_value=MagicMock()),
+        patch("litellm.proxy._experimental.mcp_server.db.get_user_oauth_credential",
+              new=AsyncMock(return_value={"refresh_token": "only-refresh"})),
+    ):
+        from litellm.proxy._experimental.mcp_server.discoverable_endpoints import token_endpoint
+        with pytest.raises(HTTPException) as ei:
+            await token_endpoint(request=MagicMock(), grant_type="refresh_token",
+                                 code=None, redirect_uri=None, client_id="claude",
+                                 client_secret=None, code_verifier=None, refresh_token=tok,
+                                 scope=None, mcp_server_name=None)
+    assert ei.value.status_code == 400
+    assert ei.value.detail == {"error": "invalid_grant"}
+
+
+@pytest.mark.asyncio
 async def test_token_endpoint_access_token_as_refresh_falls_through_to_upstream():
     # A broker ACCESS token (token_type=mcp_broker) presented as refresh_token must NOT
     # renew via the broker path — it fails the type guard and falls through to the
