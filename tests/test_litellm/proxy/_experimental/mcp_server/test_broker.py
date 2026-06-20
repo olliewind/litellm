@@ -51,3 +51,54 @@ def test_audience_check():
     assert token_audience_ok(good, expected_resource="https://llm.example.com/mcp/gitlab", master_key=_MASTER_KEY) is True
     assert token_audience_ok(bad, expected_resource="https://llm.example.com/mcp/gitlab", master_key=_MASTER_KEY) is False
     assert token_audience_ok("not-a-jwt", expected_resource="https://llm.example.com/mcp/gitlab", master_key=_MASTER_KEY) is False
+
+
+from litellm.proxy._experimental.mcp_server.broker import (
+    mint_broker_refresh_token, decode_broker_refresh_token,
+    peek_broker_refresh_server_id,
+)
+
+_RES = "https://llm.example.com/mcp/gitlab"
+
+
+def test_refresh_mint_roundtrips_and_carries_principal():
+    tok = mint_broker_refresh_token(principal="mcp-oauth:abc", server_id="s1",
+                                    resource=_RES, master_key=_MASTER_KEY, ttl_seconds=3600)
+    claims = decode_broker_refresh_token(tok, expected_resource=_RES, master_key=_MASTER_KEY)
+    assert claims is not None
+    assert claims["user_id"] == "mcp-oauth:abc"
+    assert claims["server_id"] == "s1"
+    assert claims["token_type"] == "mcp_broker_refresh"
+
+
+def test_refresh_decode_rejects_wrong_audience():
+    tok = mint_broker_refresh_token(principal="p", server_id="s1", resource=_RES,
+                                    master_key=_MASTER_KEY, ttl_seconds=3600)
+    assert decode_broker_refresh_token(
+        tok, expected_resource="https://llm.example.com/mcp/other",
+        master_key=_MASTER_KEY) is None
+
+
+def test_refresh_decode_rejects_expired():
+    tok = mint_broker_refresh_token(principal="p", server_id="s1", resource=_RES,
+                                    master_key=_MASTER_KEY, ttl_seconds=-10)
+    assert decode_broker_refresh_token(tok, expected_resource=_RES, master_key=_MASTER_KEY) is None
+
+
+def test_refresh_decode_rejects_access_token_replayed_as_refresh():
+    # An access token (token_type=mcp_broker) shares signature+audience but must NOT
+    # be accepted as a refresh token — the token_type guard rejects it.
+    access = mint_broker_token(principal="p", server_id="s1", resource=_RES,
+                               master_key=_MASTER_KEY, ttl_seconds=3600)
+    assert decode_broker_refresh_token(access, expected_resource=_RES, master_key=_MASTER_KEY) is None
+
+
+def test_refresh_decode_rejects_garbage():
+    assert decode_broker_refresh_token("not-a-jwt", expected_resource=_RES, master_key=_MASTER_KEY) is None
+
+
+def test_peek_server_id_unverified():
+    tok = mint_broker_refresh_token(principal="p", server_id="s1", resource=_RES,
+                                    master_key=_MASTER_KEY, ttl_seconds=3600)
+    assert peek_broker_refresh_server_id(tok) == "s1"          # read without master key
+    assert peek_broker_refresh_server_id("garbage") is None
