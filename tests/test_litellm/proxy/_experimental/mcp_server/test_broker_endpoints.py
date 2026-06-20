@@ -298,6 +298,7 @@ async def test_broker_token_mint_includes_refresh_token():
     assert claims["token_type"] == "mcp_broker_refresh"
     assert claims["user_id"] == "mcp-oauth:abc"
     assert claims["server_id"] == "s1"
+    assert result["expires_in"] == 3600
 
 
 def _mint_refresh(server_id="s1", resource="https://llm.example.com/mcp/gitlab",

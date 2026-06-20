@@ -740,6 +740,8 @@ async def broker_token_refresh(*, request: Request, payload: dict,
         "Database not connected. Cannot refresh broker token."
     )
     cred = await get_user_oauth_credential(prisma_client, principal, server_id)
+    # Gate is DB-row existence + non-empty access_token, NOT upstream-IdP liveness:
+    # an IdP-side revocation surfaces later at the MCP request path, not here.
     if not cred or not cred.get("access_token"):
         raise HTTPException(status_code=400, detail={"error": "invalid_grant"})
 
