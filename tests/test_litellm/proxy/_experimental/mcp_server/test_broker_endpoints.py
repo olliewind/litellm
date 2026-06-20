@@ -274,3 +274,26 @@ def test_prm_advertises_litellm_as_as_and_canonical_resource():
         prm = _build_oauth_protected_resource_response(MagicMock(), "gitlab", True)
     assert prm["resource"] == "https://llm.example.com/mcp/gitlab"            # canonical RS URI
     assert prm["authorization_servers"] == ["https://llm.example.com/gitlab"]  # LiteLLM is the AS (not upstream)
+
+
+@pytest.mark.asyncio
+async def test_broker_token_mint_includes_refresh_token():
+    server = _broker_server()
+    verifier = "the-verifier"
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    data = {"broker_code": True, "principal": "mcp-oauth:abc", "server_id": "s1",
+            "client_code_challenge": challenge, "client_redirect_uri": "https://claude/cb"}
+    key = "test-master-key-0123456789abcdef0123456789abcdef"
+    with (
+        patch(f"{D}.get_mcp_server_by_id", return_value=server),
+        patch(f"{D}.get_request_base_url", return_value="https://llm.example.com"),
+        patch(f"{D}._get_broker_master_key", return_value=key),
+    ):
+        from litellm.proxy._experimental.mcp_server.discoverable_endpoints import broker_token_mint
+        result = await broker_token_mint(request=MagicMock(), data=data, code_verifier=verifier)
+    assert "refresh_token" in result
+    claims = jwt.decode(result["refresh_token"], key, algorithms=["HS256"],
+                        audience="https://llm.example.com/mcp/gitlab")
+    assert claims["token_type"] == "mcp_broker_refresh"
+    assert claims["user_id"] == "mcp-oauth:abc"
+    assert claims["server_id"] == "s1"

@@ -28,7 +28,14 @@ from litellm.proxy.common_utils.http_parsing_utils import _read_request_body
 from litellm.proxy.utils import get_server_root_path
 from litellm.types.mcp import MCPAuth
 from litellm.types.mcp_server.mcp_server_manager import MCPServer
-from litellm.proxy._experimental.mcp_server.broker import establish_principal, mint_broker_token
+from litellm.proxy._experimental.mcp_server.broker import (
+    establish_principal,
+    mint_broker_token,
+    mint_broker_refresh_token,
+    decode_broker_refresh_token,
+    peek_broker_refresh_server_id,
+)
+from litellm.constants import MCP_BROKER_REFRESH_TOKEN_TTL
 
 router = APIRouter(
     tags=["mcp"],
@@ -685,8 +692,8 @@ def _verify_pkce_s256(verifier: str, challenge: str) -> bool:
 
 
 async def broker_token_mint(*, request: Request, data: dict, code_verifier: Optional[str]) -> Dict[str, Any]:
-    """Mint the client-facing audience-bound token from an already-decoded broker code.
-    The caller (token_endpoint) has already confirmed this is a broker code."""
+    """Mint the client-facing audience-bound access+refresh pair from an already-decoded
+    broker code. The caller (token_endpoint) has already confirmed this is a broker code."""
     if not _verify_pkce_s256(code_verifier or "", data.get("client_code_challenge") or ""):
         raise HTTPException(status_code=400, detail={"error": "invalid_grant"})
     server_id = data.get("server_id")
@@ -694,12 +701,17 @@ async def broker_token_mint(*, request: Request, data: dict, code_verifier: Opti
     if not server_id or not principal:
         raise HTTPException(status_code=400, detail={"error": "invalid_grant"})
     mcp_server = get_mcp_server_by_id(server_id)
+    resource = _broker_resource(request, mcp_server)
+    master_key = _get_broker_master_key()
     ttl = mcp_server.token_storage_ttl_seconds or 3600
     minted = mint_broker_token(
-        principal=principal, server_id=server_id,
-        resource=_broker_resource(request, mcp_server),
-        master_key=_get_broker_master_key(), ttl_seconds=ttl)
-    return {"access_token": minted, "token_type": "bearer", "expires_in": ttl}
+        principal=principal, server_id=server_id, resource=resource,
+        master_key=master_key, ttl_seconds=ttl)
+    refresh = mint_broker_refresh_token(
+        principal=principal, server_id=server_id, resource=resource,
+        master_key=master_key, ttl_seconds=MCP_BROKER_REFRESH_TOKEN_TTL)
+    return {"access_token": minted, "token_type": "bearer", "expires_in": ttl,
+            "refresh_token": refresh}
 
 
 async def _exchange_code_for_token_dict(

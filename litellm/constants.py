@@ -143,6 +143,9 @@ MCP_PER_USER_TOKEN_DEFAULT_TTL = int(
 MCP_PER_USER_TOKEN_EXPIRY_BUFFER_SECONDS = int(
     os.getenv("MCP_PER_USER_TOKEN_EXPIRY_BUFFER_SECONDS", "60")
 )
+MCP_BROKER_REFRESH_TOKEN_TTL = int(
+    os.getenv("MCP_BROKER_REFRESH_TOKEN_TTL", "2592000")  # 30 days
+)
 
 # MCP timeout defaults (seconds). Override via env vars for slow/custom MCP servers.
 MCP_CLIENT_TIMEOUT = float(os.getenv("LITELLM_MCP_CLIENT_TIMEOUT", "60.0"))
